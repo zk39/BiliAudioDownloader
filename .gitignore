@@ -10,11 +10,27 @@ pnpm-debug.log*
 dist/
 build/
 downloads/
-
+cookies.txt
  
 .env
 .env.*.local
 .env.local
 
+# 登录态 / 隐私: 绝不提交 cookie
+cookies.txt
+cookies*.txt
+
+# 调试 / 临时产物
+playinfo.json
+audio.json
+*.log
+__pycache__/
+*.py
+
+# 媒体产物
 *.mp4
 *.m4a
+*.m4s
+*.mp3
+*.flac
+*.wav

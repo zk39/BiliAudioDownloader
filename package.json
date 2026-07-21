@@ -17,7 +17,7 @@
 	"scripts": {
 		"dev": "tsx downloader.ts",
 		"start": "tsx downloader.ts",
-		"typecheck": "tsc --noEmit",
+		"typecheck": "tsc --noEmit",                                                                
 		"build": "tsc",
 		"dev:strict": "concurrently \"npm run typecheck\" \"npm run dev\"",
 		"docs": "typedoc",

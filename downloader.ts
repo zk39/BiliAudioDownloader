@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import { execSync } from 'child_process';
+import * as crypto from 'crypto';
 import pLimit from 'p-limit';
 import cliProgress from 'cli-progress';
 
@@ -56,6 +57,7 @@ interface VideoData {
 	videoArr: any[];
 	dolby: any[];
 	videoInfo: VideoInfo;
+	cid?: string; // 用于调 playurl 拿高清 dash
 }
 
 interface SeasonArchive {
@@ -270,6 +272,78 @@ function extractSeasonId(url: string): string | null {
 	return null;
 }
 
+// 方式3: 从用户空间主页URL中提取 UID (mid)
+// https://space.bilibili.com/313580179/upload/video
+// https://space.bilibili.com/313580179
+function extractSpaceMid(url: string): string | null {
+	const midMatch = url.match(/space\.bilibili\.com\/(\d+)/);
+	return midMatch ? midMatch[1] : null;
+}
+
+// 判断是否为UP主主页投稿列表URL
+function isSpaceUrl(url: string): boolean {
+	// space.bilibili.com/{mid}（带或不带 /upload/video），但排除合集 /lists/ 链接
+	return /space\.bilibili\.com\/\d+/.test(url) && !url.includes('/lists/');
+}
+
+// ==================== WBI 签名 (B站空间接口必须) ====================
+// 混淆密钥表
+const WBI_MIXIN_KEY_ENC_TAB = [
+	46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+	33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+	61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+	36, 20, 34, 44, 52
+];
+
+// WBI 密钥缓存 (避免每次请求都打 nav 接口)
+let wbiKeyCache: { imgKey: string; subKey: string; ts: number } | null = null;
+
+function getMixinKey(orig: string): string {
+	return WBI_MIXIN_KEY_ENC_TAB.map(n => orig[n]).join('').slice(0, 32);
+}
+
+// 获取 img_key / sub_key (从 nav 接口)
+async function getWbiKeys(): Promise<{ imgKey: string; subKey: string }> {
+	// 缓存 30 分钟
+	if (wbiKeyCache && Date.now() - wbiKeyCache.ts < 30 * 60 * 1000) {
+		return { imgKey: wbiKeyCache.imgKey, subKey: wbiKeyCache.subKey };
+	}
+
+	const response = await axios.get('https://api.bilibili.com/x/web-interface/nav', {
+		headers: config.headers
+	});
+
+	const wbiImg = response.data?.data?.wbi_img;
+	if (!wbiImg || !wbiImg.img_url || !wbiImg.sub_url) {
+		throw new Error('Failed to obtain WBI keys from nav API');
+	}
+
+	const imgKey = wbiImg.img_url.split('/').pop().split('.')[0];
+	const subKey = wbiImg.sub_url.split('/').pop().split('.')[0];
+
+	wbiKeyCache = { imgKey, subKey, ts: Date.now() };
+	return { imgKey, subKey };
+}
+
+// 对参数进行 WBI 签名, 返回完整 query string
+function encodeWbi(params: Record<string, string | number>, imgKey: string, subKey: string): string {
+	const mixinKey = getMixinKey(imgKey + subKey);
+	const currTime = Math.round(Date.now() / 1000);
+	const signedParams: Record<string, string | number> = { ...params, wts: currTime };
+
+	// 按 key 升序排序并过滤特殊字符
+	const query = Object.keys(signedParams)
+		.sort()
+		.map(key => {
+			const value = String(signedParams[key]).replace(/[!'()*]/g, '');
+			return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+		})
+		.join('&');
+
+	const wRid = crypto.createHash('md5').update(query + mixinKey).digest('hex');
+	return `${query}&w_rid=${wRid}`;
+}
+
 // ==================== 文件名处理 ====================
 function sanitizeFilename(filename: string): string {
 	// 只移除文件系统不允许的字符
@@ -404,19 +478,17 @@ function extractVideoDataFromHtml(html: string, bvid: string): VideoData | null 
 			bvid: bvid
 		};
 
+		// 提取 cid (第一个分P), 用于调 playurl 拿高清流
+		const cidMatch = html.match(/"cid":(\d+)/) || html.match(/&cid=(\d+)/);
+		const cid = cidMatch ? cidMatch[1] : undefined;
+
 		const videoData: VideoData = {
 			audioArr: playinfoJson.data.dash.audio || [],
 			videoArr: playinfoJson.data.dash.video || [],
 			dolby: playinfoJson.data.dash.dolby || [],
-			videoInfo: videoInfo
+			videoInfo: videoInfo,
+			cid: cid
 		};
-
-		// 可选：保存调试信息
-		fs.writeFileSync(
-			path.join(config.downloadDir, 'playinfo.json'),
-			JSON.stringify(videoData, null, 4),
-			'utf-8'
-		);
 
 		return videoData;
 	} catch (error) {
@@ -539,6 +611,301 @@ async function downloadAudioStream(audioStreams: AudioStream[], videoInfo: Video
 	return downloadAudioToFolder(audioStreams, videoInfo, config.downloadDir);
 }
 
+// ==================== 下载模式 (音频 / 视频) ====================
+// 每次输入 URL 前由用户选择, 默认仅音频
+let downloadMode: 'audio' | 'video' = 'audio';
+
+// 输出基目录: 视频模式存到 downloads/video, 音频模式仍在 downloads
+function getOutputBaseDir(): string {
+	const base = downloadMode === 'video'
+		? path.join(config.downloadDir, 'video')
+		: config.downloadDir;
+	if (!fs.existsSync(base)) {
+		fs.mkdirSync(base, { recursive: true });
+	}
+	return base;
+}
+
+// 记录最近一次流下载失败原因 (供上层报错展示)
+let lastStreamError = '';
+
+// 字节 → MB 字符串
+function fmtMB(bytes: number): string {
+	return (bytes / 1048576).toFixed(1) + 'MB';
+}
+
+// 下载单条 dash 流 (视频或音频) 到指定文件, 依次尝试各 URL 直到成功
+async function downloadStreamToFile(
+	stream: AudioStream,
+	filepath: string,
+	onProgress?: (pct: number, info: string) => void,
+	silent: boolean = false
+): Promise<boolean> {
+	const urls = [
+		stream.baseUrl,
+		stream.base_url,
+		...(stream.backupUrl || []),
+		...(stream.backup_url || [])
+	].filter((u): u is string => !!u);
+
+	if (urls.length === 0) {
+		lastStreamError = '无可用 URL';
+		return false;
+	}
+
+	// CDN 只认 UA + Referer + Range; 绝不发登录 cookie (会被 CDN 403)
+	const cdnHeaders = {
+		'user-agent': config.headers['user-agent'],
+		'referer': 'https://www.bilibili.com/',
+		'accept': '*/*',
+		'range': 'bytes=0-'
+	};
+
+	// 分块下载单块 (Range), 每块最多重试 3 次
+	const CHUNK = 4 * 1024 * 1024;   // 4MB 一段
+	const CHUNK_CONCURRENCY = 6;      // 并发段数 (B站按连接限速, 多连接叠加带宽)
+	const getChunk = async (url: string, start: number, end: number): Promise<Buffer> => {
+		let err: any;
+		for (let i = 0; i < 3; i++) {
+			try {
+				const r = await axios.get(url, {
+					headers: { ...cdnHeaders, range: `bytes=${start}-${end}` },
+					responseType: 'arraybuffer',
+					decompress: false,
+					timeout: 30000,
+					maxContentLength: Infinity,
+					maxBodyLength: Infinity
+				});
+				return Buffer.from(r.data);
+			} catch (e) {
+				err = e;
+				await new Promise(res => setTimeout(res, 800 * (i + 1)));
+			}
+		}
+		throw err;
+	};
+
+	let lastInfo = 'no url';
+	for (const url of urls) {
+		try {
+			// 1) 探测总大小 (Range 0-0 → Content-Range: bytes 0-0/TOTAL)
+			const probe = await axios.get(url, {
+				headers: { ...cdnHeaders, range: 'bytes=0-0' },
+				responseType: 'arraybuffer',
+				decompress: false,
+				timeout: 20000
+			});
+			if (probe.status !== 206 && probe.status !== 200) {
+				lastInfo = `status ${probe.status}`;
+				continue;
+			}
+			let total = 0;
+			const cr = probe.headers['content-range'];
+			if (cr) {
+				const m = String(cr).match(/\/(\d+)\s*$/);
+				if (m) total = parseInt(m[1], 10);
+			}
+			if (!total) total = parseInt(probe.headers['content-length'] || '0', 10);
+
+			// 2) 并发分段下载 + 定位写盘 (多连接叠加带宽, 某块卡住只重试该块, 不拖累整体)
+			if (total > 0) {
+				const ranges: Array<[number, number]> = [];
+				for (let s = 0; s < total; s += CHUNK) {
+					ranges.push([s, Math.min(s + CHUNK - 1, total - 1)]);
+				}
+				const fd = fs.openSync(filepath, 'w');
+				try {
+					const limit = pLimit(CHUNK_CONCURRENCY);
+					let done = 0;
+					const t0 = Date.now();
+					await Promise.all(ranges.map(([s, e]) => limit(async () => {
+						const buf = await getChunk(url, s, e);
+						await new Promise<void>((resolve, reject) => {
+							fs.write(fd, buf, 0, buf.length, s, (err) => err ? reject(err) : resolve());
+						});
+						done += (e - s + 1);
+						const elapsed = (Date.now() - t0) / 1000;
+						const speed = elapsed > 0 ? done / elapsed : 0;
+						if (onProgress) {
+							onProgress(
+								Math.min(100, Math.round((done * 100) / total)),
+								`${fmtMB(done)}/${fmtMB(total)} ${fmtMB(speed)}/s`
+							);
+						}
+					})));
+				} finally {
+					fs.closeSync(fd);
+				}
+			} else {
+				// 未知大小: 退回整段流式
+				const writer = fs.createWriteStream(filepath);
+				try {
+					const res = await axios.get(url, { headers: cdnHeaders, responseType: 'stream', decompress: false });
+					await new Promise<void>((resolve, reject) => {
+						res.data.on('error', reject);
+						writer.on('error', reject);
+						writer.on('finish', () => resolve());
+						res.data.pipe(writer);
+					});
+				} catch (inner) {
+					writer.destroy();
+					throw inner;
+				}
+			}
+
+			if (fs.existsSync(filepath) && fs.statSync(filepath).size > 0) {
+				return true;
+			}
+			lastInfo = 'empty file';
+		} catch (e: any) {
+			lastInfo = e.response ? `HTTP ${e.response.status}` : (e.code || e.message || String(e));
+			try { fs.unlinkSync(filepath); } catch (_) { /* ignore */ }
+			continue;
+		}
+	}
+	lastStreamError = lastInfo;
+	if (!silent) log(chalk.gray(`  (stream 下载失败: ${lastInfo})`));
+	return false;
+}
+
+// 调 playurl 接口拿高清 dash 流。网页嵌入的 __playinfo__ 画质被限死,
+// 这里显式请求 fnval=4048(全量 dash)+ qn=127(最高档),1080P+/大会员档由账号决定。
+async function fetchHighQualityDash(bvid: string, cid: string): Promise<{ video: any[], audio: AudioStream[] } | null> {
+	try {
+		const { imgKey, subKey } = await getWbiKeys();
+		const params: Record<string, string | number> = {
+			bvid: bvid,
+			cid: cid,
+			qn: 127,
+			fnval: 4048,
+			fourk: 1,
+			otype: 'json',
+			platform: 'pc'
+		};
+		const query = encodeWbi(params, imgKey, subKey);
+		const res = await axios.get(`https://api.bilibili.com/x/player/wbi/playurl?${query}`, {
+			headers: { ...config.headers, referer: `https://www.bilibili.com/video/${bvid}` }
+		});
+		const json = res.data;
+		if (json.code !== 0 || !json.data?.dash?.video) {
+			return null;
+		}
+		// 仅取普通 AAC 音频 (dash.audio), 保证 ffmpeg -c copy 能直接封进 mp4
+		return { video: json.data.dash.video, audio: json.data.dash.audio || [] };
+	} catch (_) {
+		return null;
+	}
+}
+
+// 下载视频: 取最高画质视频流 + 最高音频流, 用 ffmpeg 合并为 mp4
+async function downloadVideoToFolder(
+	videoStreams: any[],
+	audioStreams: AudioStream[],
+	videoInfo: VideoInfo,
+	targetFolder: string,
+	silent: boolean = false,
+	progressCallback?: (progress: number, status: string) => void
+): Promise<boolean> {
+	if (!videoStreams || videoStreams.length === 0) {
+		if (!silent) log(chalk.red('No video streams found to download.'));
+		if (progressCallback) progressCallback(0, chalk.red('✗ No video'));
+		return false;
+	}
+
+	// 先按画质档 id 降序 (80=1080P, 116=1080P60, 120=4K, 127=8K), 同档再按带宽
+	const bestVideo = [...videoStreams].sort(
+		(a, b) => ((b.id || 0) - (a.id || 0)) || ((b.bandwidth || 0) - (a.bandwidth || 0))
+	)[0];
+	const bestAudio = (audioStreams && audioStreams.length)
+		? [...audioStreams].sort((a, b) => b.bandwidth - a.bandwidth)[0]
+		: null;
+
+	const base = generateFilename(videoInfo, 'mp4').replace(/\.mp4$/i, '');
+	const vTemp = path.join(targetFolder, `${base}.video.m4s`);
+	const aTemp = path.join(targetFolder, `${base}.audio.m4s`);
+	const outPath = path.join(targetFolder, `${base}.mp4`);
+
+	try {
+		// 1) 下载视频流 (占 5-55%)
+		if (progressCallback) progressCallback(5, chalk.cyan('Video...'));
+		const vOk = await downloadStreamToFile(bestVideo, vTemp, (p, info) => {
+			if (progressCallback) progressCallback(5 + Math.round(p * 0.5), chalk.cyan(`视频 ${info}`));
+		}, silent);
+		if (!vOk) {
+			if (!silent) log(chalk.red(`❌ 视频流下载失败 (${lastStreamError || '未知'})`));
+			if (progressCallback) progressCallback(0, chalk.red(`✗ ${lastStreamError || 'Failed'}`));
+			return false;
+		}
+
+		// 2) 下载音频流 (占 55-80%)
+		let aOk = false;
+		if (bestAudio) {
+			if (progressCallback) progressCallback(55, chalk.cyan('Audio...'));
+			aOk = await downloadStreamToFile(bestAudio, aTemp, (p, info) => {
+				if (progressCallback) progressCallback(55 + Math.round(p * 0.25), chalk.cyan(`音频 ${info}`));
+			}, silent);
+		}
+
+		// 3) ffmpeg 合并 (占 80-100%)
+		if (progressCallback) progressCallback(85, chalk.magenta('Merging...'));
+		const ffmpegExe = ffmpegPath || config.ffmpegPath || 'ffmpeg';
+		const command = aOk
+			? `"${ffmpegExe}" -i "${vTemp}" -i "${aTemp}" -c copy -y -loglevel error "${outPath}"`
+			: `"${ffmpegExe}" -i "${vTemp}" -c copy -y -loglevel error "${outPath}"`;
+		execSync(command, { stdio: 'pipe' });
+
+		// 清理临时分离文件
+		try { fs.unlinkSync(vTemp); } catch (_) { /* ignore */ }
+		try { if (aOk) fs.unlinkSync(aTemp); } catch (_) { /* ignore */ }
+
+		if (!silent) log(chalk.green(`✅ Video saved: ${base}.mp4`));
+		if (progressCallback) progressCallback(100, chalk.green('✓ Done'));
+		return true;
+	} catch (error: any) {
+		try { fs.unlinkSync(vTemp); } catch (_) { /* ignore */ }
+		try { fs.unlinkSync(aTemp); } catch (_) { /* ignore */ }
+		const msg = error instanceof Error ? error.message : String(error);
+		if (!silent) {
+			log(chalk.red(`❌ Video merge failed: ${msg}`));
+			log(chalk.yellow('Hint: 确保 ffmpeg 可用 (npm install ffmpeg-static)'));
+		}
+		if (progressCallback) progressCallback(0, chalk.red('✗ Failed'));
+		return false;
+	}
+}
+
+// 按当前模式分发: 视频 → 下视频并合并; 音频 → 原有逻辑
+async function downloadMediaToFolder(
+	videoData: VideoData,
+	targetFolder: string,
+	silent: boolean = false,
+	progressCallback?: (progress: number, status: string) => void
+): Promise<boolean> {
+	if (downloadMode === 'video') {
+		let videoStreams = videoData.videoArr;
+		let audioStreams = videoData.audioArr;
+		// 用 playurl 接口把网页里被限死的画质升级到最高 (1080P/60、4K 等)
+		if (videoData.cid) {
+			const hq = await fetchHighQualityDash(videoData.videoInfo.bvid, videoData.cid);
+			if (hq && hq.video.length > 0) {
+				videoStreams = hq.video;
+				if (hq.audio.length > 0) audioStreams = hq.audio;
+			}
+		}
+		return downloadVideoToFolder(videoStreams, audioStreams, videoData.videoInfo, targetFolder, silent, progressCallback);
+	}
+	return downloadAudioToFolder(videoData.audioArr, videoData.videoInfo, targetFolder, silent, progressCallback);
+}
+
+// 询问下载类型 (视频 / 仅音频)
+function askDownloadType(rl: readline.Interface): Promise<'audio' | 'video'> {
+	return new Promise((resolve) => {
+		rl.question(chalk.yellow('下载类型?  [1] 仅音频(默认)   [2] 视频(自动合并为 mp4) : '), (ans) => {
+			resolve(ans.trim() === '2' ? 'video' : 'audio');
+		});
+	});
+}
+
 // ==================== 合集列表获取 ====================
 async function fetchAllSeasonArchives(seasonId: string): Promise<{ archives: SeasonArchive[], meta: SeasonMeta } | null> {
 	try {
@@ -589,6 +956,291 @@ async function fetchAllSeasonArchives(seasonId: string): Promise<{ archives: Sea
 		const errorMsg = error instanceof Error ? error.message : String(error);
 		log(chalk.red('Error fetching season archives:', errorMsg));
 		return null;
+	}
+}
+
+// ==================== UP主主页视频列表获取 ====================
+// 把 "MM:SS" / "HH:MM:SS" 时长字符串转换为秒数
+function parseDurationToSeconds(length: string): number {
+	if (!length) return 0;
+	const parts = length.split(':').map(p => parseInt(p, 10) || 0);
+	return parts.reduce((acc, val) => acc * 60 + val, 0);
+}
+
+// 把空间接口返回的 vlist 条目映射为 SeasonArchive 结构, 以复用预览/下载逻辑
+function mapVlistToArchive(v: any): SeasonArchive {
+	// title 偶尔含 <em class="keyword"> 高亮标签, 去除之
+	const cleanTitle = String(v.title || '').replace(/<[^>]+>/g, '').trim();
+	return {
+		aid: v.aid,
+		bvid: v.bvid,
+		ctime: v.created,
+		duration: parseDurationToSeconds(v.length),
+		title: cleanTitle,
+		pic: v.pic,
+		pubdate: v.created,
+		stat: {
+			view: v.play || 0,
+			vt: 0,
+			danmaku: v.video_review || 0
+		},
+		state: 0,
+		ugc_pay: 0,
+		vt_display: '',
+		is_lesson_video: 0
+	};
+}
+
+// ==================== HTTP (axios, 携带登录 cookie) ====================
+// -352 风控的真因是 cookie 登录态失效 / bili_ticket 过期, 不是 TLS。
+// axios 会带上 config.headers.cookie (含 SESSDATA), 配合自动续 bili_ticket 即可。
+
+// 发 GET 并返回 JSON (带完整登录 cookie + 浏览器头)
+async function httpGetJson(url: string, headers: Record<string, string>): Promise<any> {
+	const merged = { ...config.headers, ...headers };
+	const res = await axios.get(url, { headers: merged });
+	return res.data;
+}
+
+// 解析 cookie 里 bili_ticket(JWT) 的过期时间; 无/解析失败返回 0
+function getBiliTicketExp(cookie: string): number {
+	const m = cookie.match(/bili_ticket=([^;]+)/);
+	if (!m) return 0;
+	try {
+		const payload = m[1].split('.')[1];
+		const json = JSON.parse(Buffer.from(payload, 'base64').toString('utf-8'));
+		return json.exp || 0;
+	} catch (_) {
+		return 0;
+	}
+}
+
+// 自动刷新 bili_ticket (只活 3 天, 过期就 -352)。无需重新登录, 用 bili_jct 做 csrf。
+async function refreshBiliTicket(): Promise<void> {
+	const cookie = config.headers.cookie || '';
+	const exp = getBiliTicketExp(cookie);
+	const now = Math.floor(Date.now() / 1000);
+	// 还有 >10 分钟才过期则不刷新
+	if (exp && exp - now > 600) {
+		return;
+	}
+
+	try {
+		const csrfMatch = cookie.match(/bili_jct=([^;]+)/);
+		const csrf = csrfMatch ? csrfMatch[1] : '';
+		const ts = now;
+		const hexsign = crypto.createHmac('sha256', 'XgwSnGZ1p').update(`ts${ts}`).digest('hex');
+		const url = `https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket`
+			+ `?key_id=ec02&hexsign=${hexsign}&context%5Bts%5D=${ts}&csrf=${csrf}`;
+
+		const res = await axios.post(url, null, {
+			headers: {
+				...config.headers,
+				'accept': '*/*',
+				'origin': 'https://www.bilibili.com',
+				'referer': 'https://www.bilibili.com/'
+			}
+		});
+
+		const body = res.data;
+		const ticket = body?.data?.ticket;
+		if (!ticket) {
+			log(chalk.gray(`bili_ticket 刷新无效: ${JSON.stringify(body).slice(0, 150)}`));
+			return;
+		}
+
+		let newCookie = cookie;
+		newCookie = /bili_ticket=([^;]+)/.test(newCookie)
+			? newCookie.replace(/bili_ticket=[^;]*/, `bili_ticket=${ticket}`)
+			: `${newCookie}; bili_ticket=${ticket}`;
+		config.headers.cookie = newCookie;
+		// 写回 cookies.txt, 让下次直接用新票
+		try { fs.writeFileSync(config.cookieFile, newCookie, 'utf-8'); } catch (_) { /* ignore */ }
+		log(chalk.green('🎟️  bili_ticket 已自动刷新'));
+	} catch (e: any) {
+		log(chalk.gray(`bili_ticket 刷新跳过: ${e?.message || e}`));
+	}
+}
+
+// 获取某个UP主的全部投稿视频 (axios + WBI 签名 + 分页)
+async function fetchAllSpaceVideos(mid: string): Promise<{ archives: SeasonArchive[], meta: SeasonMeta } | null> {
+	try {
+		log(chalk.blue('Fetching uploader video list...'));
+
+		// cookie 诊断 (SESSDATA 缺失则未登录, 必被风控)
+		const ckBefore = config.headers.cookie || '';
+		const ckHas = (k: string) => ckBefore.includes(k + '=');
+		if (!ckHas('SESSDATA')) {
+			log(chalk.yellow('⚠️  cookies.txt 缺 SESSDATA (HttpOnly, 需从 Network→请求头 Cookie 整行复制)。未登录必被风控。'));
+		}
+
+		// bili_ticket 只活 3 天, 过期自动续票 (无需重新登录)
+		await refreshBiliTicket();
+
+		const ck = config.headers.cookie || '';
+		const exp = getBiliTicketExp(ck);
+		const leftMin = exp ? Math.round((exp - Date.now() / 1000) / 60) : 0;
+		log(chalk.gray(`Cookie 诊断: SESSDATA=${ckHas('SESSDATA')} bili_ticket 剩余=${leftMin}min bili_jct=${ckHas('bili_jct')}`));
+
+		const reqHeaders: Record<string, string> = {
+			'accept': '*/*',
+			'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+			'cache-control': 'no-cache',
+			'origin': 'https://space.bilibili.com',
+			'pragma': 'no-cache',
+			'priority': 'u=1, i',
+			'referer': `https://space.bilibili.com/${mid}/upload/video`,
+			'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+			'sec-ch-ua-mobile': '?0',
+			'sec-ch-ua-platform': '"Windows"',
+			'sec-fetch-dest': 'empty',
+			'sec-fetch-mode': 'cors',
+			'sec-fetch-site': 'same-site',
+			'cookie': ck
+		};
+
+		// 1) 获取 WBI 密钥
+		const nav = await httpGetJson('https://api.bilibili.com/x/web-interface/nav', reqHeaders);
+		const wbiImg = nav?.data?.wbi_img;
+		if (!wbiImg || !wbiImg.img_url || !wbiImg.sub_url) {
+			log(chalk.red('Failed to obtain WBI keys from nav API'));
+			log(chalk.gray(`nav raw: ${JSON.stringify(nav).slice(0, 300)}`));
+			return null;
+		}
+		// nav 通过, 说明能正常访问 B 站 (isLogin 见上方诊断)
+		log(chalk.gray(`nav OK, isLogin=${nav?.data?.isLogin}, uname=${nav?.data?.uname || ''}`));
+		const imgKey = wbiImg.img_url.split('/').pop().split('.')[0];
+		const subKey = wbiImg.sub_url.split('/').pop().split('.')[0];
+
+		// 2) 翻页拉全部投稿
+		const rawList: any[] = [];
+		let authorName = '';
+		let total = 0;
+		let pageNum = 1;
+		const pageSize = 25;
+
+		while (true) {
+			const params: Record<string, string | number> = {
+				mid: mid,
+				ps: pageSize,
+				pn: pageNum,
+				order: 'pubdate',
+				index: 1,
+				order_avoided: 'true',
+				platform: 'web',
+				web_location: '333.1387',
+				// 反爬指纹参数 dm_* (配合 WBI 签名一起绕过 -352)
+				dm_img_list: '[]',
+				dm_img_str: 'V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ',
+				dm_cover_img_str: 'QU5HTEUgKEludGVsLCBJbnRlbChSKSBVSEQgR3JhcGhpY3MgNjMwICgweDAwMDAzRTkyKSBEaXJlY3QzRDExIHZzXzVfMCBwc181XzAsIEQzRDExKUdvb2dsZSBJbmMuIChJbnRlbCk',
+				dm_img_inter: '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}'
+			};
+			const query = encodeWbi(params, imgKey, subKey);
+			const json = await httpGetJson(`https://api.bilibili.com/x/space/wbi/arc/search?${query}`, reqHeaders);
+
+			if (!json) {
+				log(chalk.red('No/invalid response from space API'));
+					return null;
+			}
+			if (json.code !== 0) {
+				log(chalk.red(`API Error: ${json.message} (code ${json.code})`));
+				log(chalk.gray(`arc/search raw: ${JSON.stringify(json).slice(0, 300)}`));
+				log(chalk.gray(`signed query: ${query.slice(0, 200)}`));
+				if (json.code === -352) {
+					log(chalk.yellow('仍被风控 (-352)。请确认 cookies.txt 为已登录的完整 cookie, 或稍后重试。'));
+				}
+					return null;
+			}
+
+			const data = json.data;
+			const vlist: any[] = data?.list?.vlist || [];
+			total = data?.page?.count ?? total;
+
+			if (!authorName && vlist.length > 0) {
+				authorName = vlist[0].author || '';
+			}
+			if (vlist.length === 0) break;
+
+			rawList.push(...vlist);
+			log(chalk.gray(`Fetched page ${pageNum}, total: ${rawList.length}/${total}`));
+
+			if (rawList.length >= total) break;
+			pageNum++;
+			await new Promise(resolve => setTimeout(resolve, 400));
+		}
+
+
+		if (rawList.length === 0) {
+			log(chalk.red('No videos found for this uploader.'));
+			return null;
+		}
+
+		const allArchives: SeasonArchive[] = rawList.map(mapVlistToArchive);
+
+		// 按发布时间升序排序 (由先到后: 最早的视频排在前面)
+		allArchives.sort((a, b) => a.pubdate - b.pubdate);
+
+		const meta: SeasonMeta = {
+			category: 0,
+			cover: allArchives[0]?.pic || '',
+			description: '',
+			mid: parseInt(mid, 10),
+			name: authorName,
+			ptime: 0,
+			season_id: 0,
+			total: allArchives.length,
+			// title 同时用作下载文件夹名, 因此直接使用UP主名字
+			title: authorName || `UP_${mid}`
+		};
+
+		log(chalk.green(`✅ Fetched ${allArchives.length} videos from uploader\n`));
+		return { archives: allArchives, meta };
+
+	} catch (error: any) {
+		const errorMsg = error instanceof Error ? error.message : String(error);
+		log(chalk.red('Error fetching uploader videos:', errorMsg));
+		return null;
+	}
+}
+
+// 下载某个UP主主页的全部投稿视频 (复用合集的菜单/预览/下载流程)
+async function downloadSpace(url: string, rl: readline.Interface): Promise<boolean> {
+	try {
+		const mid = extractSpaceMid(url);
+		if (!mid) {
+			log(chalk.red('Failed to extract UID (mid) from space URL'));
+			return false;
+		}
+
+		const result = await fetchAllSpaceVideos(mid);
+		if (!result) {
+			return false;
+		}
+
+		const { archives, meta } = result;
+
+		while (true) {
+			const choice = await showSeasonMenu(archives, meta, rl);
+
+			if (choice === 'cancel') {
+				log(chalk.yellow('\nCancelled.\n'));
+				return false;
+			}
+
+			if (choice === 'preview') {
+				await previewSeasonArchives(archives, meta, rl);
+				continue;
+			}
+
+			if (choice === 'download') {
+				return await downloadSeasonArchives(archives, meta, rl);
+			}
+		}
+
+	} catch (error: any) {
+		const errorMsg = error instanceof Error ? error.message : String(error);
+		log(chalk.red('Error during space download:', errorMsg));
+		return false;
 	}
 }
 
@@ -745,8 +1397,32 @@ async function downloadSingleVideo(url: string): Promise<boolean> {
 		log(chalk.green(`BVID: ${videoData.videoInfo.bvid}`));
 		log(chalk.green(`Description: ${videoData.videoInfo.description}`));
 
-		// 5. 下载音频
-		const success = await downloadAudioStream(videoData.audioArr, videoData.videoInfo);
+		// 5. 下载 (按模式: 视频或音频; 视频存到 downloads/video), 带进度条
+		const bar = new cliProgress.SingleBar({
+			format: ' {bar} | {percentage}% | {status}',
+			hideCursor: true,
+			barCompleteChar: '█',
+			barIncompleteChar: '░',
+			clearOnComplete: false
+		}, cliProgress.Presets.shades_grey);
+		bar.start(100, 0, { status: chalk.yellow('Starting...') });
+
+		lastStreamError = '';
+		const success = await downloadMediaToFolder(
+			videoData,
+			getOutputBaseDir(),
+			true, // silent: 交给进度条显示
+			(progress, status) => bar.update(progress, { status })
+		);
+
+		bar.update(100, { status: success ? chalk.green('✓ Done') : chalk.red(`✗ ${lastStreamError || 'Failed'}`) });
+		bar.stop();
+
+		if (success) {
+			log(chalk.green('✅ 下载完成'));
+		} else {
+			log(chalk.red(`❌ 下载失败: ${lastStreamError || '未知原因'}`));
+		}
 		return success;
 	} catch (error: any) {
 		const errorMsg = error instanceof Error ? error.message : String(error);
@@ -766,6 +1442,28 @@ async function downloadSingleArchive(
 	const videoUrl = `https://www.bilibili.com/video/${archive.bvid}`;
 
 	try {
+		// 断点续传: 若该视频音频已存在则跳过 (按 "标题 - " 前缀匹配, 忽略作者名差异)
+		try {
+			const extractedTitle = sanitizeFilename(extractTitleFromBrackets(archive.title));
+			const prefix = `${extractedTitle} - `;
+			// 视频模式看 .mp4, 音频模式看音频后缀
+			const extRe = downloadMode === 'video' ? /\.mp4$/i : /\.(mp3|m4a|flac|wav)$/i;
+			if (extractedTitle && fs.existsSync(seasonFolder)) {
+				const exists = fs.readdirSync(seasonFolder).some(
+					f => f.startsWith(prefix) && extRe.test(f)
+				);
+				if (exists) {
+					videoBar.update(100, { status: chalk.gray('✓ Skipped (exists)') });
+					return {
+						success: true,
+						title: archive.title,
+						bvid: archive.bvid,
+						url: videoUrl
+					};
+				}
+			}
+		} catch (_) { /* 扫描失败则照常下载 */ }
+
 		// 获取视频数据
 		videoBar.update(0, { status: chalk.yellow('Fetching info...') });
 		const html = await fetchVideoHtml(videoUrl);
@@ -782,10 +1480,9 @@ async function downloadSingleArchive(
 			};
 		}
 
-		// 下载音频到合集文件夹，使用进度回调
-		const downloaded = await downloadAudioToFolder(
-			videoData.audioArr,
-			videoData.videoInfo,
+		// 下载到合集文件夹 (按模式: 视频或音频), 使用进度回调
+		const downloaded = await downloadMediaToFolder(
+			videoData,
 			seasonFolder,
 			true, // silent mode
 			(progress, status) => {
@@ -826,9 +1523,9 @@ async function downloadSeasonArchives(archives: SeasonArchive[], meta: SeasonMet
 		log(chalk.green(`Total videos: ${archives.length}`));
 		log(chalk.cyan(`Concurrency: ${config.concurrency} simultaneous downloads\n`));
 
-		// 创建合集文件夹
+		// 创建合集文件夹 (视频模式在 downloads/video 下)
 		const seasonFolderName = sanitizeFilename(meta.title);
-		const seasonFolder = path.join(config.downloadDir, seasonFolderName);
+		const seasonFolder = path.join(getOutputBaseDir(), seasonFolderName);
 
 		if (!fs.existsSync(seasonFolder)) {
 			fs.mkdirSync(seasonFolder, { recursive: true });
@@ -1095,10 +1792,19 @@ function cli(rl: readline.Interface, callback: () => void): void {
 		(async () => {
 			try {
 				let success = false;
+				// 先问下载类型 (视频 / 仅音频)
+				downloadMode = await askDownloadType(rl);
+				log(downloadMode === 'video'
+					? chalk.cyan('模式: 视频 (下载后自动 ffmpeg 合并为 mp4)\n')
+					: chalk.cyan('模式: 仅音频\n'));
+
 				// 判断是否为合集URL
 				if (url.includes('seasons_archives_list') || url.includes('/lists/')) {
 					// 合集URL (API格式或用户空间格式)
 					success = await downloadSeason(url, rl);
+				} else if (isSpaceUrl(url)) {
+					// UP主主页投稿列表URL (https://space.bilibili.com/{mid}/upload/video)
+					success = await downloadSpace(url, rl);
 				} else if (url.includes('bilibili.com/video/') || url.includes('BV')) {
 					// 单个视频URL
 					success = await downloadSingleVideo(url);
