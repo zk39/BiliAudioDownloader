@@ -1,11 +1,33 @@
 {
-	"devDependencies": {
-		"@types/cli-progress": "^3.11.6",
-		"@types/node": "^24.10.9",
-		"pkg": "^5.8.1",
-		"ts-node": "^10.9.2",
-		"tsx": "^4.16.0",
-		"typescript": "^5.9.3"
+	"name": "bili-audio-downloader",
+	"version": "0.1.0",
+	"description": "下载 B 站视频/合集/UP主投稿为音频(mp3)或高清视频(mp4)的命令行工具",
+	"author": "kunz",
+	"license": "MIT",
+	"keywords": ["bilibili", "audio", "video", "cli", "terminal", "downloader", "mp3", "mp4"],
+	"type": "commonjs",
+	"main": "dist/downloader.js",
+	"bin": {
+		"bad": "dist/downloader.js",
+		"bili-audio-downloader": "dist/downloader.js"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"dev": "tsx downloader.ts",
+		"start": "tsx downloader.ts",
+		"typecheck": "tsc --noEmit",
+		"build": "tsc",
+		"prepublishOnly": "npm run build",
+		"pkg:win": "tsc && pkg dist/downloader.js --targets node18-win-x64 --output build/bili-downloader-win.exe",
+		"pkg:mac": "tsc && pkg dist/downloader.js --targets node18-macos-x64 --output build/bili-downloader-macos-x64",
+		"pkg:mac-arm": "tsc && pkg dist/downloader.js --targets node18-macos-arm64 --output build/bili-downloader-macos-arm64",
+		"pkg:linux": "tsc && pkg dist/downloader.js --targets node18-linux-x64 --output build/bili-downloader-linux-x64"
 	},
 	"dependencies": {
 		"axios": "0.27.2",
@@ -14,55 +36,11 @@
 		"ffmpeg-static": "^5.3.0",
 		"p-limit": "^3.1.0"
 	},
-	"scripts": {
-		"dev": "tsx downloader.ts",
-		"start": "tsx downloader.ts",
-		"typecheck": "tsc --noEmit",                                                                
-		"build": "tsc",
-		"dev:strict": "concurrently \"npm run typecheck\" \"npm run dev\"",
-		"docs": "typedoc",
-		"pkg:win": "tsc && pkg dist/downloader.js --targets node18-win-x64 --output build/bili-downloader-win.exe",
-		"pkg:mac": "tsc && pkg dist/downloader.js --targets node18-macos-x64 --output build/bili-downloader-macos-x64",
-		"pkg:mac-arm": "tsc && pkg dist/downloader.js --targets node18-macos-arm64 --output build/bili-downloader-macos-arm64",
-		"pkg:linux": "tsc && pkg dist/downloader.js --targets node18-linux-x64 --output build/bili-downloader-linux-x64",
-		"pkg:linux-arm": "tsc && pkg dist/downloader.js --targets node18-linux-arm64 --output build/bili-downloader-linux-arm64",
-		"pkg:all": "tsc && pkg dist/downloader.js --targets node18-win-x64,node18-macos-x64,node18-macos-arm64,node18-linux-x64,node18-linux-arm64 --output build/bili-downloader"
-	},
-	"nodemonConfig": {
-		"ignore": [
-			"*.m4a",
-			"*.mp4",
-			"*.flac",
-			"*.mp3",
-			"test.html",
-			"playinfo.json",
-			"*.md"
-		],
-		"ext": "ts,js,json"
-	},
-	"bin": {
-		"bad": "./dist/downloader.js"
-	},
-	"pkg": {
-		"assets": [
-			"node_modules/chalk/**/*"
-		],
-		"targets": [
-			"node18-win-x64",
-			"node18-macos-x64"
-		]
-	},
-	"files": [
-		"dist",
-		"README.md",
-		"README.en-US.md",
-		"README.zh-CN.md",
-		"package.json"
-	],
-	"name": "bili-audio-downloader",
-	"version": "0.0.3e",
-	"description": "Download and convert audio from Bilibili",
-	"author": "kunz",
-	"license": "MIT",
-	"keywords": ["bilibili","audio","cli","terminal","audiodownloader"]
+	"devDependencies": {
+		"@types/cli-progress": "^3.11.6",
+		"@types/node": "^24.10.9",
+		"pkg": "^5.8.1",
+		"tsx": "^4.16.0",
+		"typescript": "^5.9.3"
+	}
 }

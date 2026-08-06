@@ -628,6 +628,10 @@ function getOutputBaseDir(): string {
 
 // 记录最近一次流下载失败原因 (供上层报错展示)
 let lastStreamError = '';
+// 记录最近一次视频选流信息 (来源 + 分辨率 + qn), 用于诊断画质
+let lastVideoPick = '';
+// 累积画质诊断 (下载结束后统一打印, 避免和进度条串行)
+let lastQualityDiag = '';
 
 // 字节 → MB 字符串
 function fmtMB(bytes: number): string {
@@ -771,30 +775,88 @@ async function downloadStreamToFile(
 // 调 playurl 接口拿高清 dash 流。网页嵌入的 __playinfo__ 画质被限死,
 // 这里显式请求 fnval=4048(全量 dash)+ qn=127(最高档),1080P+/大会员档由账号决定。
 async function fetchHighQualityDash(bvid: string, cid: string): Promise<{ video: any[], audio: AudioStream[] } | null> {
-	try {
-		const { imgKey, subKey } = await getWbiKeys();
-		const params: Record<string, string | number> = {
-			bvid: bvid,
-			cid: cid,
-			qn: 127,
-			fnval: 4048,
-			fourk: 1,
-			otype: 'json',
-			platform: 'pc'
-		};
-		const query = encodeWbi(params, imgKey, subKey);
-		const res = await axios.get(`https://api.bilibili.com/x/player/wbi/playurl?${query}`, {
-			headers: { ...config.headers, referer: `https://www.bilibili.com/video/${bvid}` }
-		});
-		const json = res.data;
-		if (json.code !== 0 || !json.data?.dash?.video) {
+	// playurl 是 XHR/API 请求, 必须用 API 头 (不能用 config.headers 那套文档导航头, 否则 WAF 412)
+	const headers = {
+		'user-agent': config.headers['user-agent'],
+		'accept': 'application/json, text/plain, */*',
+		'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'origin': 'https://www.bilibili.com',
+		'referer': `https://www.bilibili.com/video/${bvid}`,
+		'sec-fetch-dest': 'empty',
+		'sec-fetch-mode': 'cors',
+		'sec-fetch-site': 'same-site',
+		'cookie': config.headers.cookie || ''
+	};
+
+	// 解析 playurl 返回
+	const parse = (json: any, tag: string): { video: any[], audio: AudioStream[] } | null => {
+		if (!json || json.code !== 0) {
+			lastQualityDiag += `${tag} code=${json?.code} ${json?.message || ''}; `;
 			return null;
 		}
-		// 仅取普通 AAC 音频 (dash.audio), 保证 ffmpeg -c copy 能直接封进 mp4
-		return { video: json.data.dash.video, audio: json.data.dash.audio || [] };
-	} catch (_) {
-		return null;
+		if (!json.data?.dash?.video) {
+			lastQualityDiag += `${tag} 无dash; `;
+			return null;
+		}
+		const vids = json.data.dash.video;
+		const ids = [...new Set(vids.map((v: any) => v.id))].sort((a: any, b: any) => b - a);
+		lastQualityDiag += `${tag} 可用qn=[${ids.join(',')}] accept=[${(json.data.accept_quality || []).join(',')}]; `;
+		return { video: vids, audio: json.data.dash.audio || [] };
+	};
+
+	const errDetail = (e: any) => [
+		e?.response?.status ? `http=${e.response.status}` : '',
+		e?.code ? `code=${e.code}` : '',
+		e?.message ? `msg=${e.message}` : ''
+	].filter(Boolean).join(' ') || String(e);
+
+	// 探测登录态 + 大会员 (画质档位受此决定: 未登录=480P, 登录=1080P, 大会员=1080P60/4K)
+	try {
+		const nav = await axios.get('https://api.bilibili.com/x/web-interface/nav', { headers });
+		lastQualityDiag += `isLogin=${nav.data?.data?.isLogin} vip=${nav.data?.data?.vipStatus}; `;
+	} catch (e: any) {
+		lastQualityDiag += `nav异常: ${errDetail(e)}; `;
 	}
+
+	// 0) 用 view 接口拿权威 cid (HTML 里第一个 "cid" 常是相关推荐视频, 会导致 playurl -404)
+	let realCid = cid;
+	try {
+		const v = await axios.get(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, { headers });
+		if (v.data?.code === 0 && v.data.data?.cid) {
+			realCid = String(v.data.data.cid);
+			lastQualityDiag += `view cid=${realCid}; `;
+		} else {
+			lastQualityDiag += `view code=${v.data?.code}; `;
+		}
+	} catch (e: any) {
+		lastQualityDiag += `view异常: ${errDetail(e)}; `;
+	}
+
+	// 1) WBI 版
+	try {
+		const { imgKey, subKey } = await getWbiKeys();
+		const query = encodeWbi(
+			{ bvid, cid: realCid, qn: 127, fnval: 4048, fourk: 1, otype: 'json', platform: 'pc' },
+			imgKey, subKey
+		);
+		const res = await axios.get(`https://api.bilibili.com/x/player/wbi/playurl?${query}`, { headers });
+		const got = parse(res.data, 'wbi');
+		if (got) return got;
+	} catch (e: any) {
+		lastQualityDiag += `wbi异常: ${errDetail(e)}; `;
+	}
+
+	// 2) 非 WBI 经典接口兜底
+	try {
+		const url = `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${realCid}&qn=127&fnval=4048&fourk=1&otype=json`;
+		const res = await axios.get(url, { headers });
+		const got = parse(res.data, 'plain');
+		if (got) return got;
+	} catch (e: any) {
+		lastQualityDiag += `plain异常: ${errDetail(e)}; `;
+	}
+
+	return null;
 }
 
 // 下载视频: 取最高画质视频流 + 最高音频流, 用 ffmpeg 合并为 mp4
@@ -819,6 +881,10 @@ async function downloadVideoToFolder(
 	const bestAudio = (audioStreams && audioStreams.length)
 		? [...audioStreams].sort((a, b) => b.bandwidth - a.bandwidth)[0]
 		: null;
+
+	// 记录选中画质 (供上层诊断)
+	const mbps = bestVideo.bandwidth ? (bestVideo.bandwidth / 1e6).toFixed(1) + 'Mbps' : '?';
+	lastVideoPick = `${lastVideoPick} → 选中 ${bestVideo.width || '?'}x${bestVideo.height || '?'} qn=${bestVideo.id} 码率${mbps}`;
 
 	const base = generateFilename(videoInfo, 'mp4').replace(/\.mp4$/i, '');
 	const vTemp = path.join(targetFolder, `${base}.video.m4s`);
@@ -884,13 +950,18 @@ async function downloadMediaToFolder(
 	if (downloadMode === 'video') {
 		let videoStreams = videoData.videoArr;
 		let audioStreams = videoData.audioArr;
+		lastQualityDiag = '';
+		lastVideoPick = 'HTML内嵌流(通常低清)';
 		// 用 playurl 接口把网页里被限死的画质升级到最高 (1080P/60、4K 等)
 		if (videoData.cid) {
 			const hq = await fetchHighQualityDash(videoData.videoInfo.bvid, videoData.cid);
 			if (hq && hq.video.length > 0) {
 				videoStreams = hq.video;
 				if (hq.audio.length > 0) audioStreams = hq.audio;
+				lastVideoPick = 'playurl高清流';
 			}
+		} else {
+			lastVideoPick = 'HTML内嵌流(未取到 cid, 无法升级)';
 		}
 		return downloadVideoToFolder(videoStreams, audioStreams, videoData.videoInfo, targetFolder, silent, progressCallback);
 	}
@@ -902,6 +973,23 @@ function askDownloadType(rl: readline.Interface): Promise<'audio' | 'video'> {
 	return new Promise((resolve) => {
 		rl.question(chalk.yellow('下载类型?  [1] 仅音频(默认)   [2] 视频(自动合并为 mp4) : '), (ans) => {
 			resolve(ans.trim() === '2' ? 'video' : 'audio');
+		});
+	});
+}
+
+// 下视频才需要 cookie (拿 1080P 登录态); 没有则询问, 可跳过(跳过则最高 480P)
+function promptCookieForVideo(rl: readline.Interface): Promise<void> {
+	return new Promise((resolve) => {
+		rl.question(chalk.yellow('下视频需登录 cookie 才能拿高清(1080P)。粘贴完整 cookie(含 SESSDATA),或直接回车跳过(只下 480P): '), (input) => {
+			const c = input.trim();
+			if (c) {
+				config.headers.cookie = c;
+				try { fs.writeFileSync(config.cookieFile, c, 'utf-8'); } catch (_) { /* ignore */ }
+				log(chalk.green('cookie 已保存\n'));
+			} else {
+				log(chalk.gray('未提供 cookie, 视频将只有 480P\n'));
+			}
+			resolve();
 		});
 	});
 }
@@ -1418,6 +1506,10 @@ async function downloadSingleVideo(url: string): Promise<boolean> {
 		bar.update(100, { status: success ? chalk.green('✓ Done') : chalk.red(`✗ ${lastStreamError || 'Failed'}`) });
 		bar.stop();
 
+		if (downloadMode === 'video') {
+			if (lastQualityDiag) log(chalk.gray(`playurl: ${lastQualityDiag}`));
+			log(chalk.gray(`画质诊断: ${lastVideoPick}`));
+		}
 		if (success) {
 			log(chalk.green('✅ 下载完成'));
 		} else {
@@ -1796,7 +1888,12 @@ function cli(rl: readline.Interface, callback: () => void): void {
 				downloadMode = await askDownloadType(rl);
 				log(downloadMode === 'video'
 					? chalk.cyan('模式: 视频 (下载后自动 ffmpeg 合并为 mp4)\n')
-					: chalk.cyan('模式: 仅音频\n'));
+					: chalk.cyan('模式: 仅音频 (无需 cookie)\n'));
+
+				// 只有下视频且当前没有 cookie 时才索取 (音频免 cookie)
+				if (downloadMode === 'video' && !config.headers.cookie) {
+					await promptCookieForVideo(rl);
+				}
 
 				// 判断是否为合集URL
 				if (url.includes('seasons_archives_list') || url.includes('/lists/')) {
@@ -1846,19 +1943,9 @@ function main() {
 		output: process.stdout
 	});
 
-	// 加载或设置 cookies
-	const hasCookie = loadCookies();
-
-	if (!hasCookie) {
-		// 使用回调而不是 Promise
-		setupCookie(rl, () => {
-			// Cookie 设置完成后，开始主循环
-			runMainLoop(rl);
-		});
-	} else {
-		// 直接开始主循环
-		runMainLoop(rl);
-	}
+	// 加载 cookie (有就用, 没有也不强制; 仅下视频时才会按需索取)
+	loadCookies();
+	runMainLoop(rl);
 }
 
 // 主循环函数
