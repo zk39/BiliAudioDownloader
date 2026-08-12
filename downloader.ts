@@ -446,55 +446,45 @@ async function fetchSeasonData(url: string): Promise<SeasonResponse> {
 
 // ==================== 数据提取 ====================
 function extractVideoDataFromHtml(html: string, bvid: string): VideoData | null {
-	const regex = /window\.__playinfo__\s*=\s*(\{.*?\})\s*<\/script>/;
-	const match = html.match(regex);
+	// 视频信息 (标题/作者/简介) 从 meta/title 提取, 登录与否都在
+	const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/);
+	const authorMatch = html.match(/<meta[^>]*name="author"[^>]*content="([^"]*)"/);
+	const descMatch = html.match(/<meta[^>]*name="description"[^>]*content="([^"]*)"/);
 
-	if (!match || !match[1]) {
-		log(chalk.red('Failed to extract playinfo from HTML'));
-		return null;
+	let cleanTitle = titleMatch ? titleMatch[1].trim() : bvid;
+	cleanTitle = cleanTitle
+		.replace(/_哔哩哔哩_bilibili$/i, '')
+		.replace(/ - 哔哩哔哩$/i, '')
+		.replace(/\s+$/, '')
+		.trim();
+
+	const videoInfo: VideoInfo = {
+		title: cleanTitle,
+		author: authorMatch ? authorMatch[1] : 'Unknown',
+		description: descMatch ? descMatch[1].replace(/\s*[，,]\s*相关视频[:：]?\s*.*$/, '').trim() : '',
+		uploadDate: '',
+		bvid: bvid
+	};
+
+	// 提取 cid (第一个分P), 用于调 playurl 拿流
+	const cidMatch = html.match(/"cid":(\d+)/) || html.match(/&cid=(\d+)/);
+	const cid = cidMatch ? cidMatch[1] : undefined;
+
+	// __playinfo__ 仅在登录时才内嵌; 有就作为快速通道, 没有则留空, 后续走 playurl 接口取流
+	let audioArr: AudioStream[] = [];
+	let videoArr: any[] = [];
+	let dolby: any[] = [];
+	const match = html.match(/window\.__playinfo__\s*=\s*(\{.*?\})\s*<\/script>/);
+	if (match && match[1]) {
+		try {
+			const pj = JSON.parse(match[1]);
+			audioArr = pj?.data?.dash?.audio || [];
+			videoArr = pj?.data?.dash?.video || [];
+			dolby = pj?.data?.dash?.dolby || [];
+		} catch (_) { /* 解析失败就留空, 走 playurl */ }
 	}
 
-	try {
-		const playinfoJson = JSON.parse(match[1]);
-
-		// 提取视频信息
-		const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/);
-		const authorMatch = html.match(/<meta[^>]*name="author"[^>]*content="([^"]*)"/);
-		const descMatch = html.match(/<meta[^>]*name="description"[^>]*content="([^"]*)"/);
-
-		// 清理标题：移除 "_哔哩哔哩_bilibili" 等后缀
-		let cleanTitle = titleMatch ? titleMatch[1].trim() : 'Unknown';
-		cleanTitle = cleanTitle
-			.replace(/_哔哩哔哩_bilibili$/i, '')
-			.replace(/ - 哔哩哔哩$/i, '')
-			.replace(/\s+$/, '')
-			.trim();
-
-		const videoInfo: VideoInfo = {
-			title: cleanTitle,
-			author: authorMatch ? authorMatch[1] : 'Unknown',
-			description: descMatch ? descMatch[1].replace(/\s*[，,]\s*相关视频[:：]?\s*.*$/, '').trim() : '',
-			uploadDate: '',
-			bvid: bvid
-		};
-
-		// 提取 cid (第一个分P), 用于调 playurl 拿高清流
-		const cidMatch = html.match(/"cid":(\d+)/) || html.match(/&cid=(\d+)/);
-		const cid = cidMatch ? cidMatch[1] : undefined;
-
-		const videoData: VideoData = {
-			audioArr: playinfoJson.data.dash.audio || [],
-			videoArr: playinfoJson.data.dash.video || [],
-			dolby: playinfoJson.data.dash.dolby || [],
-			videoInfo: videoInfo,
-			cid: cid
-		};
-
-		return videoData;
-	} catch (error) {
-		log(chalk.red('Failed to parse playinfo JSON:', error));
-		return null;
-	}
+	return { audioArr, videoArr, dolby, videoInfo, cid };
 }
 
 // ==================== 下载功能 ====================
@@ -947,25 +937,37 @@ async function downloadMediaToFolder(
 	silent: boolean = false,
 	progressCallback?: (progress: number, status: string) => void
 ): Promise<boolean> {
+	const bvid = videoData.videoInfo.bvid;
+
 	if (downloadMode === 'video') {
 		let videoStreams = videoData.videoArr;
 		let audioStreams = videoData.audioArr;
 		lastQualityDiag = '';
 		lastVideoPick = 'HTML内嵌流(通常低清)';
-		// 用 playurl 接口把网页里被限死的画质升级到最高 (1080P/60、4K 等)
-		if (videoData.cid) {
-			const hq = await fetchHighQualityDash(videoData.videoInfo.bvid, videoData.cid);
-			if (hq && hq.video.length > 0) {
-				videoStreams = hq.video;
-				if (hq.audio.length > 0) audioStreams = hq.audio;
-				lastVideoPick = 'playurl高清流';
-			}
-		} else {
-			lastVideoPick = 'HTML内嵌流(未取到 cid, 无法升级)';
+		// 走 playurl 接口拿最高画质 (cid 由 playurl 内部用 view 接口补全, 无需依赖 HTML cid)
+		const hq = await fetchHighQualityDash(bvid, videoData.cid || '');
+		if (hq && hq.video.length > 0) {
+			videoStreams = hq.video;
+			if (hq.audio.length > 0) audioStreams = hq.audio;
+			lastVideoPick = 'playurl高清流';
 		}
 		return downloadVideoToFolder(videoStreams, audioStreams, videoData.videoInfo, targetFolder, silent, progressCallback);
 	}
-	return downloadAudioToFolder(videoData.audioArr, videoData.videoInfo, targetFolder, silent, progressCallback);
+
+	// 音频: 优先用 HTML 内嵌流; 没有(未登录时常见)则走 playurl 接口取音频
+	let audioStreams = videoData.audioArr;
+	if (!audioStreams || audioStreams.length === 0) {
+		lastQualityDiag = '';
+		const hq = await fetchHighQualityDash(bvid, videoData.cid || '');
+		if (hq && hq.audio.length > 0) {
+			audioStreams = hq.audio;
+		}
+	}
+	if (!audioStreams || audioStreams.length === 0) {
+		if (!silent) log(chalk.red(`无法获取音频流 (${lastQualityDiag || '未知'})`));
+		return false;
+	}
+	return downloadAudioToFolder(audioStreams, videoData.videoInfo, targetFolder, silent, progressCallback);
 }
 
 // 询问下载类型 (视频 / 仅音频)

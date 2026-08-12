@@ -60,7 +60,7 @@
 		"package.json"
 	],
 	"name": "bili-audio-downloader",
-	"version": "0.0.4",
+	"version": "0.0.6",
 	"description": "Download and convert audio from Bilibili",
 	"author": "kunz",
 	"license": "MIT",

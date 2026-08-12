@@ -1,67 +1,112 @@
-[简体中文](docs/README.zh-CN.md) | [English](docs/README.en-US.md) | [About How to get your cookies/如何获得你的cookie](docs/HowToGetUrAuthToken.md)
+[简体中文](README.zh-CN.md) | [English](README.en-US.md) | [如何获得你的 cookie](HowToGetUrAuthToken.md)
 
 # BiliAudioDownloader
 
-下载 Bilibili 音频
+把 B 站视频下载成**音频(mp3)**或**高清视频(mp4)**的命令行工具。支持单个视频、合集、以及**整个 UP 主的全部投稿**。
 
-## 项目介绍
-
-这个项目的核心功能就是把 B 站视频转成音频。
-
-~~核心目的是为了让本人上下班路上可以有ai东雪莲的曲子听~~
-
-## 技术和已有功能
-
-用的 TypeScript，关于解析 HTML 部分是源自于 BV1yyN1eMEgj 这个视频的灵感。
-
-不确定 B 站的检测机制，所以下载并发数设置默认为 3，如果下载失败会将失败的数据存起来然后重新下载。
-
-### 关于 FFmpeg 和路径
-
-程序运行后会在当前路径下自动创建一个 `downloads` 文件夹，下载的音频会保存在里面。如果输入链接为 B 站合集，则所有音频会存在 downloads 文件夹下新建一个合集名的文件夹。
-
-**如果你使用 FFmpeg：**
-- 下载的 m4a 格式会自动转码成 mp3 格式
-- Release 里已经自带了一个 FFmpeg，开箱即用
-- 如果需要自己下载 FFmpeg，可以去这里：https://github.com/eugeneware/ffmpeg-static/releases
-
-**如果你不用 FFmpeg：**
-- 也能正常下载，电脑可以正常播放
-- 但是文件默认是视频格式（虽然只有音轨）
-- 可能有些播放器（比如爱国者和月光宝盒）会无法播放
-
-建议还是用 FFmpeg，这样下载的 mp3 文件兼容性更好～
+~~核心目的是为了让本人上下班路上能听 ai 东雪莲的曲子~~
 
 ---
 
-## 使用教程
+## 安装
 
-### 1. 找到你的 cookie 并粘贴它
-
-请查看"[如何获得你的cookie](/docs/HowToGetUrAuthToken.md)"页面来获取你的 B 站 Cookie
-
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/ac526053-0ca8-4df3-8a85-ff5ba139e0b7" />
-
-### 2. 复制链接并点击回车
-
-**单个视频链接示例：**
-
-```
-https://www.bilibili.com/video/BV1UBmUBqEDe/?spm_id_from=333.337.search-card.all.click
+```bash
+npm i -g bili-audio-downloader
 ```
 
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/98912072-91c2-42c6-9136-f0b431e5d667" />
+装好后在终端输入 `bad` 启动:
 
-**或者使用合集链接：**
+```bash
+bad
+```
 
-复制合集链接，粘贴它，然后点击回车
+> `ffmpeg` 已通过 `ffmpeg-static` 自动内置,无需另装。
 
-合集链接示例：
+---
 
+## 快速上手
+
+启动后会先问你**下载类型**,再让你粘贴链接:
+
+```
+下载类型?  [1] 仅音频(默认)   [2] 视频(自动合并为 mp4) :
+Enter the video/collection URL (or q/quit to exit):
+```
+
+- 输 `1`(或直接回车)= **仅音频**,转成 mp3。
+- 输 `2` = **视频**,下载后自动用 ffmpeg 合并成 mp4。
+
+然后粘贴链接回车即可。输 `q` 退出。
+
+---
+
+## 支持的链接
+
+**单个视频:**
+```
+https://www.bilibili.com/video/BV1UBmUBqEDe
+```
+
+**合集:**
 ```
 https://space.bilibili.com/1437582453/lists/1235710?type=season
 ```
 
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/6ffc1d17-4dbe-469f-9717-74491dd02fe9" />
+**UP 主主页(下载该 UP 主全部投稿):**
+```
+https://space.bilibili.com/313580179/upload/video
+```
+合集和主页会先显示菜单:`[1] 预览列表`  `[2] 全部下载`。
 
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/127d6e8a-5783-43fa-b22a-4afbfb511f64" />
+---
+
+## 要不要 cookie?
+
+| 下载类型 | 是否需要 cookie |
+|---|---|
+| **单个视频 / 单曲 → 音频** | **不需要**,直接下 |
+| **视频(想要 1080P 高清)** | **需要**(登录态);不给则最高只有 480P |
+| **合集 / UP 主主页(列表)** | **需要**(列表接口有风控) |
+
+- 选「视频」且当前没 cookie 时,程序才会提示你粘贴 cookie(可回车跳过,只下 480P)。
+- 怎么拿 cookie 见 [如何获得你的 cookie](HowToGetUrAuthToken.md)。**必须包含 `SESSDATA`**(它是 HttpOnly,要从浏览器 F12 → Network → 请求头 Cookie 整行复制,不能用 `document.cookie`)。
+
+### 画质档位(B 站规则,对所有工具都一样)
+
+- 未登录(游客):最高 **480P**
+- 登录:最高 **1080P**
+- 大会员:**1080P60 / 4K / HDR**
+
+程序会自动选账号能拿到的**最高画质**。
+
+### cookie 会过期
+
+- `bili_ticket`(3 天):**程序自动续**,不用管。
+- `SESSDATA`:名义半年,但 B 站会**不定期轮换**(可能几天)。一旦失效,视频会掉回 480P,或合集/主页报「风控(-352)」。这时重新粘一份新 cookie 即可。
+
+---
+
+## 输出位置
+
+程序在**当前目录**下创建 `downloads` 文件夹:
+
+- 音频 → `downloads/`(合集/主页会建以 合集名 / UP主名 命名的子文件夹)
+- 视频 → `downloads/video/`(同样按 合集名 / UP主名 分子文件夹)
+
+**断点续传:** 同一个合集/UP主重复下载时,已存在的文件会自动**跳过**,只补没下的或上次失败的。
+
+---
+
+## 常见问题
+
+**下的视频很糊/只有 480P?**
+没登录或 cookie 失效。选视频模式时粘贴含 `SESSDATA` 的完整 cookie。程序会打印 `画质诊断` 行,`isLogin=false` 就是 cookie 失效了。
+
+**长视频下载慢/卡住?**
+已用**多段并发下载**(6 段并行 + 每段重试),进度条会显示 `已下/总量 + 速度`。B 站按单连接限速,并发能叠加带宽。
+
+**番剧 / 剧集(`bangumi/play/epXXXX`)下不了?**
+这类是 PGC 内容,结构不同,暂不支持。
+
+**下载失败会怎样?**
+合集/主页下载失败的条目会存到 `failed_downloads.json`,可选择重试。
