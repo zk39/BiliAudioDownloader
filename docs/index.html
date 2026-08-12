@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Bilibili Audio Downloader - Download audio from Bilibili videos and collections">
+    <meta name="description" content="Command-line tool to save Bilibili videos as MP3 audio or HD MP4 video — single videos, collections, or a whole uploader.">
     <title>Bilibili Audio Downloader</title>
     <style>
         * {
@@ -538,13 +538,13 @@
     <header>
         <div class="container">
             <h1 class="logo">🎵 Bilibili Audio Downloader</h1>
-            <p class="subtitle">Download audio from Bilibili videos and collections effortlessly</p>
-            
+            <p class="subtitle">A small command-line tool that saves Bilibili videos as MP3 audio or HD MP4 video.</p>
+
             <div class="badges">
-                <span class="badge">✨ Multi-Progress Bars</span>
-                <span class="badge">🚀 Concurrent Downloads</span>
-                <span class="badge">🎼 MP3/FLAC/M4A Support</span>
-                <span class="badge">📦 Collection Support</span>
+                <span class="badge">MP3 audio</span>
+                <span class="badge">MP4 video, up to 4K</span>
+                <span class="badge">Whole uploader / collection</span>
+                <span class="badge">Resume + parallel download</span>
             </div>
 
             <div class="cta-buttons">
@@ -561,27 +561,23 @@
     <!-- Features -->
     <section class="features">
         <div class="container">
-            <h2 class="section-title">✨ Features</h2>
+            <h2 class="section-title">What it does</h2>
             <div class="features-grid">
                 <div class="feature-card">
-                    <div class="feature-icon">🎯</div>
-                    <h3>Single & Collection</h3>
-                    <p>Download individual videos or entire collections with ease</p>
+                    <h3>Audio or video</h3>
+                    <p>Each time you paste a link it asks: audio only (MP3), or the full video merged to MP4 with ffmpeg.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">📊</div>
-                    <h3>Multi-Progress Bars</h3>
-                    <p>Track multiple downloads with beautiful progress indicators</p>
+                    <h3>Quality follows your account</h3>
+                    <p>Guest gets 480p video, logged in gets 1080p, premium gets 1080p60/4K. Audio is full quality with no login needed.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">⚡</div>
-                    <h3>Concurrent Downloads</h3>
-                    <p>Download up to 3 tracks simultaneously for maximum speed</p>
+                    <h3>One video, a collection, or a whole channel</h3>
+                    <p>Paste a single link, a season/collection, or an uploader's page to pull every video they've posted.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">🎼</div>
-                    <h3>Format Options</h3>
-                    <p>Choose between MP3 (320k), FLAC, or M4A formats</p>
+                    <h3>Resume and don't stall</h3>
+                    <p>Re-running skips files you already have. Long videos download in parallel segments so they don't hang.</p>
                 </div>
             </div>
         </div>
@@ -590,67 +586,78 @@
     <!-- How to Use -->
     <section class="how-to-use">
         <div class="container">
-            <h2 class="section-title">🚀 How to Use</h2>
+            <h2 class="section-title">How to use</h2>
             <div class="steps">
-                <!-- Step 0 -->
+                <!-- Install -->
                 <div class="step">
-                    <span class="step-number">0</span>
-                    <h3>Install</h3>
-                    <p>Install via npm and run the command:</p>
+                    <span class="step-number">1</span>
+                    <h3>Install and run</h3>
+                    <p>Install it globally from npm, then type <code>bad</code>:</p>
                     <div class="code-block">
-                        <code>npm i bili-audio-downloader</code><br>
+                        <code>npm i -g bili-audio-downloader</code><br>
                         <code>bad</code>
                     </div>
-                    <img src="https://github.com/user-attachments/assets/f73b887c-fc1a-4d31-b797-88b1e21fc56a" 
-                         alt="Install screenshot" 
+                    <p>ffmpeg comes bundled, so there's nothing else to install.</p>
+                    <img src="https://github.com/user-attachments/assets/f73b887c-fc1a-4d31-b797-88b1e21fc56a"
+                         alt="Running the tool"
                          class="step-image"
                          width="1238"
                          height="900">
                 </div>
 
-                <!-- Step 1 -->
+                <!-- Choose type -->
                 <div class="step">
-                    <span class="step-number">1</span>
-                    <h3>Get Your Cookie</h3>
-                    <p>Go to <strong>bilibili.com</strong>, open DevTools (F12 or right-click → Inspect), and type:</p>
-                    <div class="code-block">
-                        <code>document.cookie</code>
-                    </div>
-                    <p>Copy the entire cookie string and paste it when prompted.</p>
-                    <img src="https://github.com/user-attachments/assets/ac526053-0ca8-4df3-8a85-ff5ba139e0b7" 
-                         alt="Cookie screenshot" 
+                    <span class="step-number">2</span>
+                    <h3>Audio or video?</h3>
+                    <p>It asks first. Press <code>1</code> for audio (saved as MP3) or <code>2</code> for video (merged to MP4). Audio needs no login — if that's all you want, skip the next step.</p>
+                </div>
+
+                <!-- Cookie, only for 1080p -->
+                <div class="step">
+                    <span class="step-number">3</span>
+                    <h3>Cookie — only if you want 1080p video</h3>
+                    <p>Audio and 480p video work with nothing. A cookie is only needed to unlock <strong>1080p and up</strong> for video, because Bilibili keeps HD behind login (4K and 1080p60 also need premium).</p>
+                    <p>Grab it from a logged-in browser: <strong>F12 → Network</strong>, click any request to <code>bilibili.com</code>, and copy the whole <strong>Cookie</strong> request header. It has to include <code>SESSDATA</code>.</p>
+                    <p style="color:#888;">Skip <code>document.cookie</code> — <code>SESSDATA</code> is HttpOnly and never shows up there. That trips a lot of people up.</p>
+                    <img src="https://github.com/user-attachments/assets/ac526053-0ca8-4df3-8a85-ff5ba139e0b7"
+                         alt="Copying the Cookie header"
                          class="step-image"
                          width="2086"
                          height="900">
                 </div>
 
-                <!-- Step 2 -->
+                <!-- Paste link -->
                 <div class="step">
-                    <span class="step-number">2</span>
-                    <h3>Paste the Link</h3>
-                    <p>Copy a Bilibili video or collection link and paste it:</p>
-                    
-                    <p><strong>For single video:</strong></p>
+                    <span class="step-number">4</span>
+                    <h3>Paste a link</h3>
+
+                    <p><strong>A single video:</strong></p>
                     <div class="link-example">
                         https://www.bilibili.com/video/BV1UBmUBqEDe/
                     </div>
-                    <img src="https://github.com/user-attachments/assets/98912072-91c2-42c6-9136-f0b431e5d667" 
-                         alt="Single video download" 
+                    <img src="https://github.com/user-attachments/assets/98912072-91c2-42c6-9136-f0b431e5d667"
+                         alt="Single video"
                          class="step-image"
                          width="1736"
                          height="900">
 
-                    <p style="margin-top: 30px;"><strong>For collections:</strong></p>
+                    <p style="margin-top: 30px;"><strong>A whole collection:</strong></p>
                     <div class="link-example">
                         https://space.bilibili.com/1437582453/lists/1235710?type=season
                     </div>
-                    <img src="https://github.com/user-attachments/assets/6ffc1d17-4dbe-469f-9717-74491dd02fe9" 
-                         alt="Collection list" 
+
+                    <p style="margin-top: 30px;"><strong>Every video from one uploader:</strong></p>
+                    <div class="link-example">
+                        https://space.bilibili.com/313580179/upload/video
+                    </div>
+                    <p>Collections and uploader pages open a menu — preview the list first, or just download everything. Files go to <code>downloads/</code> (video ends up in <code>downloads/video/</code>), and re-running only fills in what's missing.</p>
+                    <img src="https://github.com/user-attachments/assets/6ffc1d17-4dbe-469f-9717-74491dd02fe9"
+                         alt="Collection list"
                          class="step-image"
                          width="1904"
                          height="900">
-                    <img src="https://github.com/user-attachments/assets/127d6e8a-5783-43fa-b22a-4afbfb511f64" 
-                         alt="Collection download" 
+                    <img src="https://github.com/user-attachments/assets/127d6e8a-5783-43fa-b22a-4afbfb511f64"
+                         alt="Downloading a collection"
                          class="step-image"
                          width="1582"
                          height="900"
@@ -663,9 +670,9 @@
     <!-- Download -->
     <section class="download-section" id="download">
         <div class="container">
-            <h2 class="section-title">📥 Download</h2>
+            <h2 class="section-title">Get it</h2>
             <p style="font-size: 1.2rem; color: #aaaaaa; margin-bottom: 20px;">
-                Choose your platform and start downloading
+                npm works everywhere; there's also a prebuilt Windows exe.
             </p>
 
             <div class="download-grid">
